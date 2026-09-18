@@ -1,0 +1,169 @@
+name: Axiom Pilot 3 (grpc-api)
+
+# Manually triggered only, with an explicit commit SHA input -- never reacts to pull_request/push
+# events, so no external contributor can cause this workflow (or its secret, below) to run.
+# Selection of which SHA to evaluate happens outside this workflow, under a fixed, mechanical
+# eligibility rule decided in advance (see pilot/grpc-java-pilot-3-ledger.md); this workflow only
+# executes whatever SHA it is explicitly told to.
+#
+# This is the exact two-job security architecture already proven for Dubbo Pilot 1 and Maven
+# Pilot 2 (Nandini1212/dubbo and Nandini1212/maven's own axiom-pilot.yml), reused unchanged:
+#   - test-grpc-api: checks out and tests the (untrusted) selected commit. This job never
+#     references any secret anywhere in its YAML -- not job-level env, not step-level env,
+#     nothing. Arbitrary code at the selected commit can therefore never observe a secret that
+#     was never present in its process environment to begin with.
+#   - axiom-analysis: never checks out the selected (untrusted) commit at all -- only this
+#     fork's own default branch (for the rules file we authored), the private Axiom action
+#     itself (checked out explicitly with the PAT, since Nandini1212/grpc-java is public and
+#     Nandini1212/axiom is private -- GitHub does not resolve a private `uses: owner/repo@ref`
+#     action reference from a public caller), and the JUnit XML artifact the first job produced.
+#     Only this job references the private-Axiom-download secret.
+#
+# Scope note (see pilot/grpc-java-pilot-3-ledger.md compatibility qualification): :grpc-context
+# was found to be an empty legacy publishing shell with zero source/tests and was rejected.
+# :grpc-api is the qualified scope -- confirmed to run only its own 598-test suite while
+# building grpc-core/grpc-stub/grpc-inprocess/grpc-util/grpc-testing solely as compiled
+# dependencies (their own test tasks never execute). `-PskipAndroid=true` is required because
+# Gradle's configuration phase evaluates the entire multi-project build (including Android
+# modules) regardless of the scoped task requested.
+on:
+  workflow_dispatch:
+    inputs:
+      commit-sha:
+        description: "Exact upstream grpc-java commit SHA to evaluate (selected mechanically, before seeing any CI/test outcome)"
+        required: true
+      pr-number:
+        description: "Optional upstream PR number, for pilot record-keeping only -- not interpolated into any shell command"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  test-grpc-api:
+    name: "Run grpc-api tests (untrusted checkout -- no secrets in this job)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: "Check out the exact selected commit"
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit-sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: "Set up JDK 21"
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      # continue-on-error keeps this step from immediately failing the job, so the artifact
+      # upload below still runs on a real test failure -- the job's true conclusion is restored
+      # by the final step, after evidence has already been captured.
+      - name: "Run grpc-api tests (scoped, Android modules skipped)"
+        id: test
+        run: ./gradlew :grpc-api:test -PskipAndroid=true --console=plain --no-daemon
+        continue-on-error: true
+
+      - name: "Record pilot metadata"
+        if: always()
+        run: |
+          mkdir -p pilot-metadata
+          printf '%s' "${{ inputs.commit-sha }}" > pilot-metadata/commit-sha.txt
+          printf '%s' "${{ inputs.pr-number }}" > pilot-metadata/pr-number.txt
+          printf '%s' "${{ steps.test.outcome }}" > pilot-metadata/test-outcome.txt
+          printf '%s' "${{ github.run_id }}" > pilot-metadata/run-id.txt
+
+      - name: "Upload JUnit XML and pilot metadata"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pilot-test-evidence
+          path: |
+            api/build/test-results/test/*.xml
+            pilot-metadata/*.txt
+          if-no-files-found: warn
+
+      # Restores the job's real conclusion (red if the actual grpc-api tests failed) after
+      # evidence has already been uploaded -- continue-on-error above must not silently turn a
+      # real test failure into a green job.
+      - name: "Preserve the original test outcome"
+        if: always()
+        run: |
+          if [ "${{ steps.test.outcome }}" = "failure" ]; then
+            echo "grpc-api tests failed (expected/normal pilot data -- see pilot-test-evidence artifact)"
+            exit 1
+          fi
+
+  axiom-analysis:
+    name: "Axiom investigation (trusted -- never executes the tested commit's code)"
+    needs: test-grpc-api
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # Deliberately our own fork's default branch, never the untrusted commit-sha input --
+      # this only supplies the rules file we authored ourselves.
+      - name: "Check out this fork's own rules"
+        uses: actions/checkout@v4
+
+      - name: "Download test evidence"
+        uses: actions/download-artifact@v4
+        with:
+          name: pilot-test-evidence
+          path: evidence
+
+      - name: "Build the report-file list"
+        id: reports
+        run: |
+          {
+            echo "list<<AXIOM_REPORT_EOF"
+            find evidence -name "*.xml" -path "*test-results*"
+            echo "AXIOM_REPORT_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # Nandini1212/grpc-java is PUBLIC; Nandini1212/axiom is PRIVATE. GitHub does not resolve a
+      # private `uses: owner/repo@ref` action reference for a public calling repository -- the
+      # documented, correct pattern: explicitly check out the private action's exact released
+      # tag using the PAT (this step only, trusted job only), then reference it as a local path.
+      - name: "Check out the private Axiom action"
+        uses: actions/checkout@v4
+        with:
+          repository: Nandini1212/axiom
+          ref: v1.3.2
+          token: ${{ secrets.AXIOM_ACCESS_TOKEN }}
+          path: .axiom-action
+
+      - name: "Investigate with Axiom (locally checked-out action)"
+        id: axiom
+        uses: ./.axiom-action
+        with:
+          rules-file: .axiom-pilot/rules.yaml
+          report-file: ${{ steps.reports.outputs.list }}
+          snapshot-output: axiom-pilot-snapshot.json
+          # This job never checks out inputs.commit-sha itself (see the security-boundary
+          # comment above), so action.yml's own github.sha-based default would resolve to this
+          # fork's own workflow commit instead of the actual tested commit -- passing it
+          # explicitly is the v1.3.2 fix for exactly that provenance defect, already proven on
+          # Dubbo Pilot 1 and Maven Pilot 2, applied here unchanged.
+          commit-sha: ${{ inputs.commit-sha }}
+          github-token: ${{ secrets.AXIOM_ACCESS_TOKEN }}
+
+      - name: "Upload Axiom snapshot"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: axiom-pilot-snapshot
+          path: axiom-pilot-snapshot.json
+          if-no-files-found: warn
+
+      - name: "Summary"
+        if: always()
+        run: |
+          echo "## Pilot 3 run summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Original grpc-api test outcome: see the test-grpc-api job's own conclusion (independent of this job)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Axiom investigation step outcome: ${{ steps.axiom.outcome }}" >> "$GITHUB_STEP_SUMMARY"
